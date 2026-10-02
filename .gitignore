@@ -1,0 +1,7 @@
+# Build artifacts
+/dist/
+bin/
+
+# Go
+*.test
+*.out
