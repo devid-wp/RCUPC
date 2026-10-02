@@ -1,26 +1,50 @@
-// Package app wires the client components for the Phase 1 CLI.
+// Package app wires the client components for the CLI.
 package app
 
 import (
 	"context"
-	"log/slog"
+	"errors"
 
 	"rcupc/client/session"
+	"rcupc/pkg/config"
+	"rcupc/pkg/logging"
+	"rcupc/pkg/protocol"
 )
 
-// Run connects to addr, completes the handshake and keeps the session open.
-func Run(ctx context.Context, addr string, log *slog.Logger) error {
-	log.Info("connecting", "addr", addr)
+// Run connects using cfg, completes the handshake, sends the sample commands
+// of the message phase and keeps the session open. A cancelled context is a
+// clean shutdown, not an error. cfg is read-only.
+func Run(ctx context.Context, cfg config.ClientConfig, log logging.Logger) error {
+	log.Info("connecting",
+		"addr", cfg.HostAddr,
+		"handshake_timeout", cfg.HandshakeTimeout,
+		"max_line_len", cfg.MaxLineLen,
+	)
 
-	sess, err := session.Connect(ctx, addr, log)
+	sess, err := session.Connect(ctx, cfg, log)
 	if err != nil {
 		return err
 	}
-	log.Info("connection established", "addr", addr)
+	defer func() { _ = sess.Close() }()
+	log.Info("connected", "addr", cfg.HostAddr)
 
-	if err := sess.Wait(ctx); err != nil {
-		return err
+	for _, cmd := range []protocol.Command{protocol.Info, protocol.Ping} {
+		log.Info("command sent", "command", string(cmd))
+		resp, err := sess.Send(cmd)
+		if err != nil {
+			return err
+		}
+		log.Info("response received", "command", string(cmd), "response", resp)
 	}
-	log.Info("connection closed", "addr", addr)
-	return nil
+
+	err = sess.Wait(ctx)
+	if err == nil {
+		log.Info("connection closed", "addr", cfg.HostAddr)
+		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		log.Info("shutdown", "addr", cfg.HostAddr)
+		return nil
+	}
+	return err
 }

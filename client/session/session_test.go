@@ -3,23 +3,31 @@ package session
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
-	"log/slog"
 	"net"
 	"strings"
 	"testing"
 	"time"
 
 	hostsession "rcupc/host/session"
+	"rcupc/pkg/config"
+	"rcupc/pkg/logging"
 	"rcupc/pkg/protocol"
 )
 
-func newLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+func newLogger() logging.Logger {
+	return logging.New(io.Discard, logging.LevelInfo)
 }
 
-// startHost runs a Phase 1 host session on a loopback listener and returns the
-// address the client should dial.
+func clientConfig(addr string) config.ClientConfig {
+	cfg := config.DefaultClient()
+	cfg.HostAddr = addr
+	return cfg
+}
+
+// startHost runs host sessions on a loopback listener and returns the address
+// the client should dial. It accepts until the listener is closed.
 func startHost(t *testing.T, ctx context.Context) string {
 	t.Helper()
 
@@ -30,11 +38,13 @@ func startHost(t *testing.T, ctx context.Context) string {
 	t.Cleanup(func() { ln.Close() })
 
 	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _ = hostsession.Run(ctx, conn, config.DefaultHost(), newLogger()) }()
 		}
-		_ = hostsession.Run(ctx, conn, newLogger())
 	}()
 
 	return ln.Addr().String()
@@ -44,7 +54,7 @@ func TestConnectOK(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sess, err := Connect(ctx, startHost(t, ctx), newLogger())
+	sess, err := Connect(ctx, clientConfig(startHost(t, ctx)), newLogger())
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -62,8 +72,8 @@ func TestConnectOK(t *testing.T) {
 	cancel()
 	select {
 	case err := <-waitErr:
-		if err != nil {
-			t.Fatalf("Wait after cancel: %v", err)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Wait after cancel = %v, want context.Canceled", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Wait did not return after cancel")
@@ -89,8 +99,84 @@ func TestConnectRejected(t *testing.T) {
 		_ = protocol.WriteError(conn, "version mismatch")
 	}()
 
-	_, err = Connect(context.Background(), ln.Addr().String(), newLogger())
+	_, err = Connect(context.Background(), clientConfig(ln.Addr().String()), newLogger())
 	if err == nil || !strings.Contains(err.Error(), "version mismatch") {
 		t.Fatalf("Connect error = %v, want rejection reason", err)
+	}
+}
+
+func TestSend(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sess, err := Connect(ctx, clientConfig(startHost(t, ctx)), newLogger())
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	resp, err := sess.Send(protocol.Info)
+	if err != nil {
+		t.Fatalf("Send INFO: %v", err)
+	}
+	if resp != protocol.HostInfo {
+		t.Fatalf("INFO -> %q, want %q", resp, protocol.HostInfo)
+	}
+
+	// A second command must reuse the same connection.
+	resp, err = sess.Send(protocol.Ping)
+	if err != nil {
+		t.Fatalf("Send PING: %v", err)
+	}
+	if resp != protocol.Pong {
+		t.Fatalf("PING -> %q, want %q", resp, protocol.Pong)
+	}
+}
+
+func TestSendUnknownCommand(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sess, err := Connect(ctx, clientConfig(startHost(t, ctx)), newLogger())
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	resp, err := sess.Send(protocol.Command("BOGUS"))
+	if err == nil {
+		t.Fatalf("Send BOGUS = (%q, nil), want error", resp)
+	}
+	if resp != protocol.UnknownCommand {
+		t.Fatalf("BOGUS raw response = %q, want %q", resp, protocol.UnknownCommand)
+	}
+}
+
+func TestWaitHostClose(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Complete the handshake, then close the connection.
+		_, _ = bufio.NewReader(conn).ReadString('\n')
+		_ = protocol.WriteLine(conn, protocol.OK)
+	}()
+
+	sess, err := Connect(context.Background(), clientConfig(ln.Addr().String()), newLogger())
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	if err := sess.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait after host close = %v, want nil", err)
 	}
 }

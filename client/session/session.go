@@ -7,31 +7,31 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"net"
 	"time"
 
+	"rcupc/pkg/config"
+	"rcupc/pkg/logging"
 	"rcupc/pkg/protocol"
+	"rcupc/pkg/transport"
 )
-
-const handshakeTimeout = 5 * time.Second
 
 // Session is an established connection to a host.
 type Session struct {
-	conn net.Conn
-	r    *bufio.Reader
-	log  *slog.Logger
+	conn       transport.Conn
+	r          *bufio.Reader
+	log        logging.Logger
+	maxLineLen int
 }
 
-// Connect dials addr and performs the Phase 1 handshake.
-func Connect(ctx context.Context, addr string, log *slog.Logger) (*Session, error) {
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", addr)
+// Connect dials cfg.HostAddr through the transport boundary and performs the
+// handshake using cfg.HandshakeTimeout and cfg.MaxLineLen. cfg is read-only.
+func Connect(ctx context.Context, cfg config.ClientConfig, log logging.Logger) (*Session, error) {
+	conn, err := transport.Dial(ctx, cfg.HostAddr)
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", addr, err)
+		return nil, fmt.Errorf("dial %s: %w", cfg.HostAddr, err)
 	}
 
-	if err := conn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(cfg.HandshakeTimeout)); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -41,7 +41,7 @@ func Connect(ctx context.Context, addr string, log *slog.Logger) (*Session, erro
 	}
 
 	r := bufio.NewReader(conn)
-	line, err := protocol.ReadLine(r)
+	line, err := protocol.ReadLineLimit(r, cfg.MaxLineLen)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("read handshake response: %w", err)
@@ -61,29 +61,62 @@ func Connect(ctx context.Context, addr string, log *slog.Logger) (*Session, erro
 
 	// A failed clear means the peer closed immediately after OK; not fatal.
 	_ = conn.SetDeadline(time.Time{})
-	return &Session{conn: conn, r: r, log: log}, nil
+	log.Info("handshake complete", "addr", cfg.HostAddr, "protocol", protocol.Version)
+	return &Session{conn: conn, r: r, log: log, maxLineLen: cfg.MaxLineLen}, nil
 }
 
-// Wait keeps the session open until the host closes it or ctx is cancelled.
+// Send writes one command, reads the host response and validates it. The
+// session stays open and can be reused for further commands.
+func (s *Session) Send(cmd protocol.Command) (string, error) {
+	if err := protocol.WriteMessage(s.conn, string(cmd)); err != nil {
+		return "", fmt.Errorf("write %s: %w", cmd, err)
+	}
+
+	resp, err := protocol.ReadMessageLimit(s.r, s.maxLineLen)
+	if err != nil {
+		return "", fmt.Errorf("read response to %s: %w", cmd, err)
+	}
+	if err := protocol.Validate(cmd, resp); err != nil {
+		return resp, err
+	}
+	return resp, nil
+}
+
+// Close closes the underlying connection.
+func (s *Session) Close() error {
+	return s.conn.Close()
+}
+
+// Wait keeps the session open until the host closes it or ctx is cancelled. On
+// cancellation it closes the connection (unblocking the read) and returns
+// ctx.Err(); a host-initiated close returns nil.
 func (s *Session) Wait(ctx context.Context) error {
 	stop := make(chan struct{})
-	defer close(stop)
+	watcherDone := make(chan struct{})
 	go func() {
+		defer close(watcherDone)
 		select {
 		case <-ctx.Done():
 			s.conn.Close()
 		case <-stop:
 		}
 	}()
+	defer func() {
+		close(stop)
+		<-watcherDone
+	}()
 
 	buf := make([]byte, 256)
 	for {
 		n, err := s.r.Read(buf)
 		if n > 0 {
-			s.log.Info("ignoring data (unused in Phase 1)", "bytes", n)
+			s.log.Debug("unexpected data", "bytes", n)
 		}
 		if err != nil {
-			if errors.Is(err, io.EOF) || ctx.Err() != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err

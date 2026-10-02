@@ -1,13 +1,17 @@
 // Package protocol defines the RCUPC wire format.
 //
-// Phase 1 uses a single line-based handshake:
+// The connection starts with a single line-based handshake:
 //
 //	client -> host   MIRROR/0.1 HELLO\n
 //	host   -> client MIRROR/0.1 OK\n
 //
 // On rejection the host answers MIRROR/0.1 ERROR <reason>\n and closes the
-// connection. This package knows only bytes and framing; it has no idea about
-// sockets, sessions or the meaning of a connection.
+// connection. After a successful handshake the connection enters the message
+// phase, where raw newline-delimited commands and responses are exchanged
+// (see message.go).
+//
+// This package knows only bytes and framing; it has no idea about sockets,
+// sessions or the meaning of a connection.
 package protocol
 
 import (
@@ -21,12 +25,12 @@ import (
 // Version is the protocol version implemented by this build.
 const Version = "MIRROR/0.1"
 
-// MaxLineLen bounds one handshake line so a misbehaving peer cannot make us
-// buffer unbounded data.
+// MaxLineLen bounds one newline-terminated line (handshake or message phase)
+// so a misbehaving peer cannot make us buffer unbounded data.
 const MaxLineLen = 256
 
-// ErrLineTooLong is returned when a handshake line exceeds MaxLineLen.
-var ErrLineTooLong = errors.New("protocol: handshake line too long")
+// ErrLineTooLong is returned when a line exceeds MaxLineLen.
+var ErrLineTooLong = errors.New("protocol: line too long")
 
 // Message is a handshake token.
 type Message string
@@ -74,13 +78,18 @@ func Parse(line string) (Message, string, error) {
 	return Message(parts[1]), reason, nil
 }
 
-// ReadLine reads one newline-terminated line, enforcing MaxLineLen.
+// ReadLine reads one newline-terminated line, enforcing the default MaxLineLen.
 func ReadLine(r *bufio.Reader) (string, error) {
+	return ReadLineLimit(r, MaxLineLen)
+}
+
+// ReadLineLimit reads one newline-terminated line, enforcing at most max bytes.
+func ReadLineLimit(r *bufio.Reader, max int) (string, error) {
 	var buf []byte
 	for {
 		part, err := r.ReadSlice('\n')
 		buf = append(buf, part...)
-		if len(buf) > MaxLineLen {
+		if len(buf) > max {
 			return "", ErrLineTooLong
 		}
 		switch {
